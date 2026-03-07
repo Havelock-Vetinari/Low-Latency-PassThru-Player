@@ -1,5 +1,7 @@
 # LLPTP - Low Latency PassThrough Player
 
+![demo](demo.gif)
+
 LLPTP is a high-performance macOS command-line tool written in zero-dependency Swift that routes audio from an input device directly to the default output device with minimal latency. 
 
 It is designed for real-time monitoring of external audio sources (like instruments, microphones, or game consoles connected via Capture Cards/USB interfaces) through your Mac's default speakers or headphones, bypassing the significant latencies introduced by software like QuickTime, OBS, or standard DAWs.
