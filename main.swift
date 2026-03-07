@@ -3,7 +3,16 @@ import AudioToolbox
 import Foundation
 import Darwin
 
+// MARK: - Globals
+var verboseMode = false
+
 // MARK: - Helpers
+
+func debugLog(_ msg: String) {
+    if verboseMode {
+        fputs("[DEBUG] \(msg)\n", stderr)
+    }
+}
 
 func checkErr(_ status: OSStatus, _ op: String) {
     guard status != noErr else { return }
@@ -97,10 +106,12 @@ struct DataSource {
 }
 
 func getInputDevices() -> [AudioDev] {
+    debugLog("Fetching hardware devices...")
     var sz: UInt32 = 0
     var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
     AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &sz)
     let cnt = Int(sz) / MemoryLayout<AudioDeviceID>.size
+    debugLog("Found \(cnt) total hardware devices. Filtering for inputs...")
     var ids = [AudioDeviceID](repeating: 0, count: cnt)
     AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &sz, &ids)
 
@@ -182,6 +193,7 @@ func getDataSources(_ deviceID: AudioDeviceID) -> [DataSource] {
     var sourceIDs = [UInt32](repeating: 0, count: count)
     guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &sz, &sourceIDs) == noErr else { return [] }
 
+    debugLog("Found \(count) data sources for device \(deviceID).")
     var sources: [DataSource] = []
     for srcID in sourceIDs {
         // Get source name
@@ -219,9 +231,27 @@ func getCurrentDataSource(_ deviceID: AudioDeviceID) -> UInt32? {
 }
 
 func setDataSource(_ deviceID: AudioDeviceID, sourceID: UInt32) -> Bool {
+    if getCurrentDataSource(deviceID) == sourceID {
+        debugLog("Data source is already set to ID \(sourceID) for device \(deviceID).")
+        return true
+    }
+
+    debugLog("Attempting to set data source to ID \(sourceID) for device \(deviceID)...")
     var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDataSource, mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
     var sid = sourceID
-    return AudioObjectSetPropertyData(deviceID, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &sid) == noErr
+    let status = AudioObjectSetPropertyData(deviceID, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &sid)
+    if status != noErr {
+        if getCurrentDataSource(deviceID) == sourceID {
+            debugLog("AudioObjectSetPropertyData returned OSStatus \(status), but source successfully changed to ID \(sourceID).")
+            return true
+        } else {
+            debugLog("AudioObjectSetPropertyData kAudioDevicePropertyDataSource failed with OSStatus \(status).")
+            return false
+        }
+    } else {
+        debugLog("Successfully set data source to ID \(sourceID).")
+        return true
+    }
 }
 
 // MARK: - Stream Format Query
@@ -469,7 +499,10 @@ class AudioPassthrough {
     }
 
     func start() {
+        debugLog("Starting passthrough engine...")
+        debugLog("Setting input device (\(inDevID)) buffer size to \(bufFrames)...")
         setDeviceBufferSize(inDevID, bufFrames)
+        debugLog("Setting output device (\(outDevID)) buffer size to \(bufFrames)...")
         setDeviceBufferSize(outDevID, bufFrames)
 
         let inSR = getDeviceSampleRate(inDevID)
@@ -616,12 +649,14 @@ func printUsage() {
       --sources <N>       List available sources for device N
       --buffer <frames>   Buffer size in frames (default: 128)
       --latency <ms>      Target max latency in ms (default: 10)
-      --quiet             No level meters (less CPU)
-      --help              Show this message
+      --quiet, -q         No level meters (less CPU)
+      --verbose, -v       Verbose output (debug logs)
+      --help, -h          Show this message
     """)
 }
 
 func runPassthrough(idx: Int, srcIdx: Int?, buf: UInt32, latencyMs: Double, quiet: Bool) {
+    debugLog("Initializing passthrough for device index \(idx), source index \(srcIdx ?? -1)")
     let devs = getInputDevices()
     guard idx >= 0, idx < devs.count else {
         fputs("Error: index \(idx) out of range (0-\(devs.count - 1))\n", stderr); exit(1)
@@ -686,6 +721,7 @@ while let a = args.first {
         guard let v = args.first, let ms = Double(v) else { fputs("--latency needs number (ms)\n", stderr); exit(1) }
         args = args.dropFirst(); targetLatencyMs = ms
     case "--quiet", "-q": quietMode = true
+    case "--verbose", "-v": verboseMode = true
     case "--help", "-h": printUsage(); exit(0)
     default: fputs("Unknown: \(a)\n", stderr); printUsage(); exit(1)
     }
