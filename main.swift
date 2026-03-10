@@ -2,6 +2,8 @@ import CoreAudio
 import AudioToolbox
 import Foundation
 import Darwin
+import IOKit
+import IOKit.usb
 
 // MARK: - Globals
 var verboseMode = false
@@ -97,6 +99,7 @@ final class LevelMeter {
 struct AudioDev {
     let id: AudioDeviceID
     let name: String
+    let uid: String
     let channels: Int
 }
 
@@ -119,7 +122,7 @@ func getInputDevices() -> [AudioDev] {
     for id in ids {
         let ch = getDeviceInputChannels(id)
         guard ch > 0 else { continue }
-        result.append(AudioDev(id: id, name: getDeviceName(id), channels: ch))
+        result.append(AudioDev(id: id, name: getDeviceName(id), uid: getDeviceUID(id), channels: ch))
     }
     return result
 }
@@ -131,6 +134,51 @@ func getDeviceName(_ id: AudioDeviceID) -> String {
     if AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &uName) == noErr,
        let cf = uName?.takeUnretainedValue() { return cf as String }
     return "Unknown"
+}
+
+func getDeviceUID(_ id: AudioDeviceID) -> String {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var sz = UInt32(MemoryLayout<Unmanaged<CFString>>.size)
+    var uName: Unmanaged<CFString>?
+    if AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &uName) == noErr,
+       let cf = uName?.takeUnretainedValue() { return cf as String }
+    return "UnknownUID"
+}
+
+func getUSBVendorAndProductIDs(fromUID uid: String) -> (vendor: UInt16, product: UInt16)? {
+    let parts = uid.components(separatedBy: ":")
+    guard parts.count >= 5, parts[0] == "AppleUSBAudioEngine" else { return nil }
+    
+    let locString = parts[parts.count - 2]
+    guard let targetLocId = UInt32(locString, radix: 16) else { return nil }
+    
+    guard let matchingDict = IOServiceMatching(kIOUSBDeviceClassName) else { return nil }
+    
+    var iter: io_iterator_t = 0
+    let kr = IOServiceGetMatchingServices(kIOMainPortDefault, matchingDict, &iter)
+    if kr != KERN_SUCCESS { return nil }
+    defer { IOObjectRelease(iter) }
+    
+    var device: io_service_t = IOIteratorNext(iter)
+    while device != 0 {
+        defer { 
+            let nextDevice = IOIteratorNext(iter)
+            IOObjectRelease(device)
+            device = nextDevice
+        }
+        
+        if let locationID = (IORegistryEntryCreateCFProperty(device, "locationID" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber)?.uint32Value {
+            if locationID == targetLocId {
+                let idVendor = (IORegistryEntryCreateCFProperty(device, "idVendor" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber)?.uint16Value
+                let idProduct = (IORegistryEntryCreateCFProperty(device, "idProduct" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber)?.uint16Value
+                
+                if let v = idVendor, let p = idProduct {
+                    return (v, p)
+                }
+            }
+        }
+    }
+    return nil
 }
 
 func getDeviceInputChannels(_ id: AudioDeviceID) -> Int {
@@ -762,7 +810,14 @@ if doList {
     for (i, d) in devs.enumerated() {
         let sources = getDataSources(d.id)
         let srcStr = sources.isEmpty ? "" : " [sources: \(sources.map(\.name).joined(separator: ", "))]"
-        print("  [\(i)] \(d.name) (\(d.channels) ch)\(srcStr)")
+        var uidStr = ""
+        if verboseMode {
+            uidStr = " [UID: \(d.uid)]"
+            if let (v, p) = getUSBVendorAndProductIDs(fromUID: d.uid) {
+                uidStr += String(format: " [USB: %04x:%04x]", v, p)
+            }
+        }
+        print("  [\(i)] \(d.name) (\(d.channels) ch)\(uidStr)\(srcStr)")
     }
     print()
     exit(0)
@@ -792,7 +847,14 @@ if let i = selIdx {
     for (i, d) in devs.enumerated() {
         let sources = getDataSources(d.id)
         let srcStr = sources.isEmpty ? "" : " [sources: \(sources.map(\.name).joined(separator: ", "))]"
-        print("  [\(i)] \(d.name) (\(d.channels) ch)\(srcStr)")
+        var uidStr = ""
+        if verboseMode {
+            uidStr = " [UID: \(d.uid)]"
+            if let (v, p) = getUSBVendorAndProductIDs(fromUID: d.uid) {
+                uidStr += String(format: " [USB: %04x:%04x]", v, p)
+            }
+        }
+        print("  [\(i)] \(d.name) (\(d.channels) ch)\(uidStr)\(srcStr)")
     }
     print("\nSelect device: ", terminator: "")
     guard let line = readLine(), let i = Int(line), i >= 0, i < devs.count else {
