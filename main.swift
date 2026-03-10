@@ -309,6 +309,7 @@ final class PassthroughCtx {
     let targetLatencySamples: Int  // max samples in ring before we skip
     var convBuf: UnsafeMutablePointer<Float>
     var currentLatencySamples: Int = 0  // updated by output callback
+    var underruns: Int = 0
 
     init(inputChannels: Int, fmt: AudioStreamBasicDescription, ringCapacity: Int,
          outputSR: Float64, targetLatencyMs: Double) {
@@ -473,13 +474,22 @@ func outputRenderCB(
     ctx.currentLatencySamples = ctx.ringL.readable
 
     let out = UnsafeMutableAudioBufferListPointer(ioData)
+    var underrun = false
+    
     if out.count >= 1, let d = out[0].mData?.assumingMemoryBound(to: Float.self) {
-        ctx.ringL.read(d, count: Int(frames))
+        let taken = ctx.ringL.read(d, count: Int(frames))
+        if taken < Int(frames) { underrun = true }
         ctx.meter.recOut(d, Int(frames))
     }
     if out.count >= 2, let d = out[1].mData?.assumingMemoryBound(to: Float.self) {
-        ctx.ringR.read(d, count: Int(frames))
+        let taken = ctx.ringR.read(d, count: Int(frames))
+        if taken < Int(frames) { underrun = true }
     }
+    
+    if underrun {
+        ctx.underruns &+= 1
+    }
+    
     return noErr
 }
 
@@ -579,19 +589,37 @@ class AudioPassthrough {
     func runLoop() {
         guard let ctx = ctx else { return }
         if showMeter {
+            var lastUnderruns = 0
             while true {
                 usleep(80_000)
                 let m = ctx.meter
                 let inDb  = m.inPeak > 0 ? 20 * log10(Double(m.inPeak)) : -96
                 let outDb = m.outPeak > 0 ? 20 * log10(Double(m.outPeak)) : -96
                 let latMs = Double(ctx.currentLatencySamples) / ctx.outputSampleRate * 1000.0
-                fputs("\r  IN  \(bar(m.inPeak, 30)) \(String(format:"%+6.1f",inDb))dB  \n", stderr)
-                fputs("  OUT \(bar(m.outPeak, 30)) \(String(format:"%+6.1f",outDb))dB  lat:\(String(format:"%.1f",latMs))ms  ", stderr)
-                fputs("\u{1B}[1A", stderr)
+                let und = ctx.underruns
+                let undStr = und > 0 ? "  \u{1B}[31mUNDERRUNS: \(und)\u{1B}[0m" : ""
+                
+                fputs("\r  IN  \(bar(m.inPeak, 30)) \(String(format:"%+6.1f",inDb))dB  \u{1B}[K\n", stderr)
+                fputs("\r  OUT \(bar(m.outPeak, 30)) \(String(format:"%+6.1f",outDb))dB  lat:\(String(format:"%.1f",latMs))ms\(undStr)  \u{1B}[K", stderr)
+                
+                if verboseMode && und > lastUnderruns {
+                    fputs("\n[DEBUG] Buffer underrun occurred! Total: \(und)\u{1B}[K\n", stderr)
+                    lastUnderruns = und
+                } else {
+                    fputs("\u{1B}[1A", stderr)
+                }
             }
         } else {
-            // Quiet mode: just block
-            dispatchMain()
+            // Quiet mode: check periodically for underruns
+            var lastUnderruns = 0
+            while true {
+                usleep(500_000)
+                let und = ctx.underruns
+                if und > lastUnderruns {
+                    fputs("Warning: Buffer underrun occurred (total: \(und))\n", stderr)
+                    lastUnderruns = und
+                }
+            }
         }
     }
 }
@@ -639,7 +667,7 @@ func printUsage() {
       llptp --list                         List input devices
       llptp --device <N>                   Start passthrough
       llptp --device <N> --source <S>      Select source on device
-      llptp --device <N> --buffer <frames> Custom buffer (default: 128)
+      llptp --device <N> -b <frames>       Custom buffer (default: 128)
       llptp                                Interactive mode
 
     Options:
@@ -647,7 +675,7 @@ func printUsage() {
       --device <N>        Select input device by index
       --source <S>        Select data source by index (mic, line, spdif, etc.)
       --sources <N>       List available sources for device N
-      --buffer <frames>   Buffer size in frames (default: 128)
+      --buffer, -b <frames> Buffer size in frames (default: 128)
       --latency <ms>      Target max latency in ms (default: 10)
       --quiet, -q         No level meters (less CPU)
       --verbose, -v       Verbose output (debug logs)
@@ -714,8 +742,8 @@ while let a = args.first {
     case "--sources":
         guard let v = args.first, let i = Int(v) else { fputs("--sources needs device number\n", stderr); exit(1) }
         args = args.dropFirst(); listSourcesDev = i
-    case "--buffer":
-        guard let v = args.first, let f = UInt32(v) else { fputs("--buffer needs number\n", stderr); exit(1) }
+    case "--buffer", "-b":
+        guard let v = args.first, let f = UInt32(v) else { fputs("-b/--buffer needs number\n", stderr); exit(1) }
         args = args.dropFirst(); bufFrames = f
     case "--latency":
         guard let v = args.first, let ms = Double(v) else { fputs("--latency needs number (ms)\n", stderr); exit(1) }
@@ -785,6 +813,11 @@ if let i = selIdx {
         if let sline = readLine(), !sline.isEmpty, let si = Int(sline) {
             selectedSrc = si
         }
+    }
+
+    print("\n  Enter buffer size in frames (Enter = keep \(bufFrames)): ", terminator: "")
+    if let bline = readLine(), !bline.isEmpty, let bf = UInt32(bline) {
+        bufFrames = bf
     }
 
     runPassthrough(idx: i, srcIdx: selectedSrc, buf: bufFrames, latencyMs: targetLatencyMs, quiet: quietMode)
